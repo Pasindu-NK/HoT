@@ -54,6 +54,22 @@ class ActionHead(nn.Module):
         return logits
 
 
+def normalize_action_name(a: str) -> str:
+    """
+    Human3.6M often has names like 'Photo 2', 'Directions 1', 'Walking 1'.
+    But define_actions() typically uses base names like 'Photo', 'Directions', 'Walking'.
+
+    This function maps:
+        'Photo 2'      -> 'Photo'
+        'SittingDown 1'-> 'SittingDown'
+        'Walking'      -> 'Walking'  (no change)
+    """
+    a = str(a)
+    # Split on space and take the first token as the base action
+    base = a.split(' ')[0]
+    return base
+
+
 def train(dataloader, model, action_head, optimizer, epoch,
           action_to_idx, criterion_action):
     """
@@ -79,8 +95,16 @@ def train(dataloader, model, action_head, optimizer, epoch,
 
         # ----- Action classification loss -----
         # 'action' is a list/tuple of action names, one per sample in the batch
+        # Examples: 'Photo 2', 'SittingDown 1', 'Walking', ...
+        label_indices = []
+        for a in action:
+            base = normalize_action_name(a)  # e.g. 'Photo 2' -> 'Photo'
+            # If for some reason base is still not in dict, fall back to index 0
+            idx = action_to_idx.get(base, 0)
+            label_indices.append(idx)
+
         labels = torch.tensor(
-            [action_to_idx[a] for a in action],
+            label_indices,
             device=output_3D.device,
             dtype=torch.long,
         )  # [B]
@@ -160,7 +184,8 @@ if __name__ == '__main__':
     dataset = Human36mDataset(dataset_path, args)
     actions = define_actions(args.actions)
 
-    # Map action name → index for classification
+    # Map action name → index for classification.
+    # actions here are the base names, e.g. ['Directions', 'Discussion', 'Eating', ...]
     action_to_idx = {name: i for i, name in enumerate(actions)}
     num_actions = len(actions)
 
@@ -186,7 +211,7 @@ if __name__ == '__main__':
     # ----- 3D backbone (HoT / MixSTE) -----
     model = Model(args).cuda()
 
-    # Load pretrained weights if provided
+    # Load pretrained weights if provided (same mechanism as original code)
     if args.previous_dir != '':
         Load_model(args, model)
 
