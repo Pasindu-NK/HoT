@@ -21,8 +21,10 @@ from common.h36m_dataset import Human36mDataset
 
 args = parse_args()
 
+# Set which GPUs are visible. Example: --gpu 0,1
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
+# Dynamically import model
 exec('from model.' + args.model + ' import Model')
 
 def train(dataloader, model, optimizer, epoch):
@@ -31,14 +33,22 @@ def train(dataloader, model, optimizer, epoch):
 
     for i, data in enumerate(tqdm(dataloader)):
         batch_cam, gt_3D, input_2D, input_2D_GT, action, subject, cam_ind = data
-        input_2D, input_2D_GT, gt_3D, batch_cam = input_2D.cuda(), input_2D_GT.cuda(), gt_3D.cuda(), batch_cam.cuda()
+        input_2D, input_2D_GT, gt_3D, batch_cam = (
+            input_2D.cuda(non_blocking=True),
+            input_2D_GT.cuda(non_blocking=True),
+            gt_3D.cuda(non_blocking=True),
+            batch_cam.cuda(non_blocking=True),
+        )
 
+        # Forward pass (works with single GPU or DataParallel)
         output_3D = model(input_2D)
 
         out_target = gt_3D.clone()
         out_target[:, :, args.root_joint] = 0
 
-        w_mpjpe = torch.tensor([1, 1, 2.5, 2.5, 1, 2.5, 2.5, 1, 1, 1, 1.5, 1.5, 4, 4, 1.5, 4, 4]).cuda()
+        w_mpjpe = torch.tensor(
+            [1, 1, 2.5, 2.5, 1, 2.5, 2.5, 1, 1, 1, 1.5, 1.5, 4, 4, 1.5, 4, 4]
+        ).cuda()
 
         loss_w_mpjpe = eval_loss.weighted_mpjpe(output_3D, out_target, w_mpjpe)
         loss_temporal = eval_loss.temporal_consistency(output_3D, out_target, w_mpjpe)
@@ -61,18 +71,25 @@ def test(actions, dataloader, model):
 
     action_error = define_error_list(actions)
 
-    joints_left = [4, 5, 6, 11, 12, 13] 
+    joints_left = [4, 5, 6, 11, 12, 13]
     joints_right = [1, 2, 3, 14, 15, 16]
 
     for i, data in enumerate(tqdm(dataloader, dynamic_ncols=True)):
         batch_cam, gt_3D, input_2D, input_2D_GT, action, subject, cam_ind = data
-        input_2D, input_2D_GT, gt_3D, batch_cam = input_2D.cuda(), input_2D_GT.cuda(), gt_3D.cuda(), batch_cam.cuda()
+        input_2D, input_2D_GT, gt_3D, batch_cam = (
+            input_2D.cuda(non_blocking=True),
+            input_2D_GT.cuda(non_blocking=True),
+            gt_3D.cuda(non_blocking=True),
+            batch_cam.cuda(non_blocking=True),
+        )
 
+        # input_2D shape is [B, 2, ...] (non-flip, flip)
         output_3D_non_flip = model(input_2D[:, 0])
         output_3D_flip = model(input_2D[:, 1])
 
         output_3D_flip[:, :, :, 0] *= -1
-        output_3D_flip[:, :, joints_left + joints_right, :] = output_3D_flip[:, :, joints_right + joints_left, :] 
+        output_3D_flip[:, :, joints_left + joints_right, :] = \
+            output_3D_flip[:, :, joints_right + joints_left, :]
 
         output_3D = (output_3D_non_flip + output_3D_flip) / 2
 
@@ -84,11 +101,14 @@ def test(actions, dataloader, model):
         output_3D[:, :, args.root_joint] = 0
         out_target[:, :, args.root_joint] = 0
 
-        action_error = test_calculation(output_3D, out_target, action, action_error, args.dataset, subject)
+        action_error = test_calculation(
+            output_3D, out_target, action, action_error, args.dataset, subject
+        )
 
     p1, p2 = print_error(args.dataset, action_error, 1)
 
     return p1, p2
+
 
 if __name__ == '__main__':
     seed = 1126
@@ -107,13 +127,37 @@ if __name__ == '__main__':
 
     if args.train:
         train_data = Fusion(args, dataset, args.root_path, train=True)
-        train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size,
-                            shuffle=True, num_workers=int(args.workers), pin_memory=True)
-    test_data = Fusion(args, dataset, args.root_path, train=False)
-    test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size,
-                            shuffle=False, num_workers=int(args.workers), pin_memory=True)
+        train_dataloader = torch.utils.data.DataLoader(
+            train_data,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=int(args.workers),
+            pin_memory=True,
+        )
 
-    model = Model(args).cuda()
+    test_data = Fusion(args, dataset, args.root_path, train=False)
+    test_dataloader = torch.utils.data.DataLoader(
+        test_data,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=int(args.workers),
+        pin_memory=True,
+    )
+
+    # ----- Multi-GPU setup -----
+    # Create model on CPU first
+    model = Model(args)
+
+    # If multiple GPUs are visible (e.g. CUDA_VISIBLE_DEVICES="0,1"),
+    # wrap with DataParallel so it uses both.
+    if torch.cuda.device_count() > 1:
+        print("Using", torch.cuda.device_count(), "GPUs with DataParallel")
+        model = nn.DataParallel(model)
+
+    # Move (possibly wrapped) model to GPU
+    model = model.cuda()
+
+    # ---------------------------
 
     if args.previous_dir != '':
         Load_model(args, model)
@@ -126,7 +170,7 @@ if __name__ == '__main__':
     mpjpes = []
 
     for epoch in range(1, args.nepoch + 1):
-        if args.train: 
+        if args.train:
             loss = train(train_dataloader, model, optimizer, epoch)
             loss_epochs.append(loss * 1000)
 
@@ -140,9 +184,15 @@ if __name__ == '__main__':
             args.previous_best = p1
 
         if args.train:
-            logging.info('epoch: %d, lr: %.6f, l: %.4f, p1: %.2f, p2: %.2f, %d: %.2f' % (epoch, lr, loss, p1, p2, best_epoch, args.previous_best))
-            print('%d, lr: %.6f, l: %.4f, p1: %.2f, p2: %.2f, %d: %.2f' % (epoch, lr, loss, p1, p2, best_epoch, args.previous_best))
-        
+            logging.info(
+                'epoch: %d, lr: %.6f, l: %.4f, p1: %.2f, p2: %.2f, %d: %.2f'
+                % (epoch, lr, loss, p1, p2, best_epoch, args.previous_best)
+            )
+            print(
+                '%d, lr: %.6f, l: %.4f, p1: %.2f, p2: %.2f, %d: %.2f'
+                % (epoch, lr, loss, p1, p2, best_epoch, args.previous_best)
+            )
+
             if epoch % args.lr_decay_epoch == 0:
                 lr *= args.lr_decay_large
                 for param_group in optimizer.param_groups:
@@ -150,8 +200,7 @@ if __name__ == '__main__':
             else:
                 lr *= args.lr_decay
                 for param_group in optimizer.param_groups:
-                    param_group['lr'] *= args.lr_decay 
+                    param_group['lr'] *= args.lr_decay
         else:
             print('p1: %.2f, p2: %.2f' % (p1, p2))
             break
-
