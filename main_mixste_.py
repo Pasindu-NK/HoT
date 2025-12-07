@@ -60,12 +60,11 @@ def normalize_action_name(a: str) -> str:
     But define_actions() typically uses base names like 'Photo', 'Directions', 'Walking'.
 
     This function maps:
-        'Photo 2'      -> 'Photo'
-        'SittingDown 1'-> 'SittingDown'
-        'Walking'      -> 'Walking'  (no change)
+        'Photo 2'       -> 'Photo'
+        'SittingDown 1' -> 'SittingDown'
+        'Walking'       -> 'Walking'  (no change)
     """
     a = str(a)
-    # Split on space and take the first token as the base action
     base = a.split(' ')[0]
     return base
 
@@ -74,6 +73,7 @@ def train(dataloader, model, action_head, optimizer, epoch,
           action_to_idx, criterion_action):
     """
     Train only the action head (backbone is frozen and used as feature extractor).
+    Works with single GPU or DataParallel-wrapped backbone/head.
     """
     model.eval()   # backbone frozen; keep it in eval mode
     action_head.train()
@@ -95,12 +95,10 @@ def train(dataloader, model, action_head, optimizer, epoch,
 
         # ----- Action classification loss -----
         # 'action' is a list/tuple of action names, one per sample in the batch
-        # Examples: 'Photo 2', 'SittingDown 1', 'Walking', ...
         label_indices = []
         for a in action:
             base = normalize_action_name(a)  # e.g. 'Photo 2' -> 'Photo'
-            # If for some reason base is still not in dict, fall back to index 0
-            idx = action_to_idx.get(base, 0)
+            idx = action_to_idx.get(base, 0)  # fallback to 0 if unseen
             label_indices.append(idx)
 
         labels = torch.tensor(
@@ -125,6 +123,7 @@ def train(dataloader, model, action_head, optimizer, epoch,
 def test(actions, dataloader, model):
     """
     Original HoT/MixSTE test: evaluates 3D pose (P1/P2) using the backbone only.
+    Works with single GPU or DataParallel-wrapped model.
     """
     model.eval()
 
@@ -209,9 +208,10 @@ if __name__ == '__main__':
     )
 
     # ----- 3D backbone (HoT / MixSTE) -----
-    model = Model(args).cuda()
+    # Build on CPU first so we can wrap with DataParallel later cleanly
+    model = Model(args)
 
-    # Load pretrained weights if provided (same mechanism as original code)
+    # Load pretrained weights if provided (same as original code)
     if args.previous_dir != '':
         Load_model(args, model)
 
@@ -219,9 +219,24 @@ if __name__ == '__main__':
     for p in model.parameters():
         p.requires_grad = False
 
+    # Wrap backbone with DataParallel if multiple GPUs are visible
+    if torch.cuda.device_count() > 1:
+        print("Using", torch.cuda.device_count(), "GPUs for backbone with DataParallel")
+        model = nn.DataParallel(model)
+
+    # Move (possibly wrapped) backbone to GPU
+    model = model.cuda()
+
     # ----- Action head (trainable) -----
     # Human3.6M uses 17 joints; change if you use a different skeleton
-    action_head = ActionHead(num_joints=17, num_actions=num_actions).cuda()
+    action_head = ActionHead(num_joints=17, num_actions=num_actions)
+
+    # Wrap action head with DataParallel too (optional but uses both GPUs for the head)
+    if torch.cuda.device_count() > 1:
+        print("Using", torch.cuda.device_count(), "GPUs for action head with DataParallel")
+        action_head = nn.DataParallel(action_head)
+
+    action_head = action_head.cuda()
 
     lr = args.lr
     optimizer = optim.AdamW(action_head.parameters(), lr=lr, weight_decay=0.1)
