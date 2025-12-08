@@ -120,17 +120,21 @@ def train(dataloader, model, action_head, optimizer, epoch,
     return loss_all['loss'].avg
 
 
-def test(actions, dataloader, model):
+def test(actions, dataloader, model, action_head, action_to_idx):
     """
-    Original HoT/MixSTE test: evaluates 3D pose (P1/P2) using the backbone only.
-    Works with single GPU or DataParallel-wrapped model.
+    Test 3D pose (P1/P2) using the backbone, and action accuracy using the action head.
+    Works with single GPU or DataParallel-wrapped models.
     """
     model.eval()
+    action_head.eval()
 
     action_error = define_error_list(actions)
 
     joints_left = [4, 5, 6, 11, 12, 13]
     joints_right = [1, 2, 3, 14, 15, 16]
+
+    action_correct = 0
+    action_total = 0
 
     for i, data in enumerate(tqdm(dataloader, dynamic_ncols=True)):
         batch_cam, gt_3D, input_2D, input_2D_GT, action, subject, cam_ind = data
@@ -141,6 +145,7 @@ def test(actions, dataloader, model):
             batch_cam.cuda(),
         )
 
+        # ----- 3D pose evaluation (original HoT logic) -----
         # input_2D is [B, 2, T, J, 2] (non-flip, flip)
         output_3D_non_flip = model(input_2D[:, 0])
         output_3D_flip = model(input_2D[:, 1])
@@ -163,9 +168,36 @@ def test(actions, dataloader, model):
             output_3D, out_target, action, action_error, args.dataset, subject
         )
 
+        # ----- Action accuracy (use non-flip output_3D_non_flip as features) -----
+        with torch.no_grad():
+            label_indices = []
+            for a in action:
+                base = normalize_action_name(a)
+                idx = action_to_idx.get(base, 0)
+                label_indices.append(idx)
+
+            labels = torch.tensor(
+                label_indices,
+                device=output_3D_non_flip.device,
+                dtype=torch.long,
+            )  # [B]
+
+            logits = action_head(output_3D_non_flip)  # [B, num_actions]
+            preds = torch.argmax(logits, dim=1)
+            correct = (preds == labels).sum().item()
+            total = labels.numel()
+
+            action_correct += correct
+            action_total += total
+
     p1, p2 = print_error(args.dataset, action_error, 1)
 
-    return p1, p2
+    if action_total > 0:
+        action_acc = 100.0 * action_correct / action_total
+    else:
+        action_acc = 0.0
+
+    return p1, p2, action_acc
 
 
 if __name__ == '__main__':
@@ -260,11 +292,17 @@ if __name__ == '__main__':
             loss_epochs.append(loss * 1000)
 
         with torch.no_grad():
-            p1, p2 = test(actions, test_dataloader, model)
+            p1, p2, action_acc = test(
+                actions,
+                test_dataloader,
+                model,
+                action_head,
+                action_to_idx,
+            )
             mpjpes.append(p1)
 
         # NOTE: p1 (pose error) will stay basically constant, since backbone is frozen.
-        # You still get action training via 'loss' above.
+        # You still get action training via 'loss' above and can track action_acc.
 
         if args.train and p1 < args.previous_best:
             best_epoch = epoch
@@ -273,12 +311,12 @@ if __name__ == '__main__':
 
         if args.train:
             logging.info(
-                'epoch: %d, lr: %.6f, l: %.4f, p1: %.2f, p2: %.2f, %d: %.2f'
-                % (epoch, lr, loss, p1, p2, best_epoch, args.previous_best)
+                'epoch: %d, lr: %.6f, l: %.4f, p1: %.2f, p2: %.2f, acc: %.2f, %d: %.2f'
+                % (epoch, lr, loss, p1, p2, action_acc, best_epoch, args.previous_best)
             )
             print(
-                '%d, lr: %.6f, l: %.4f, p1: %.2f, p2: %.2f, %d: %.2f'
-                % (epoch, lr, loss, p1, p2, best_epoch, args.previous_best)
+                '%d, lr: %.6f, l: %.4f, p1: %.2f, p2: %.2f, acc: %.2f, %d: %.2f'
+                % (epoch, lr, loss, p1, p2, action_acc, best_epoch, args.previous_best)
             )
 
             if epoch % args.lr_decay_epoch == 0:
@@ -290,5 +328,5 @@ if __name__ == '__main__':
                 for param_group in optimizer.param_groups:
                     param_group['lr'] *= args.lr_decay
         else:
-            print('p1: %.2f, p2: %.2f' % (p1, p2))
+            print('p1: %.2f, p2: %.2f, action_acc: %.2f' % (p1, p2, action_acc))
             break
