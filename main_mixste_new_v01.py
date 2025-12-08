@@ -28,47 +28,6 @@ os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 exec('from model.' + args.model + ' import Model')
 
 
-class ActionHead(nn.Module):
-    """
-    Simple action recognition head on top of 3D poses.
-
-    Input:  output_3D of shape [B, T, J, 3]
-    Output: logits [B, num_actions]
-    """
-    def __init__(self, num_joints=17, num_actions=15, hidden_dim=256):
-        super().__init__()
-        self.num_joints = num_joints
-        self.fc = nn.Sequential(
-            nn.Linear(num_joints * 3, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(hidden_dim, num_actions)
-        )
-
-    def forward(self, x):
-        # x: [B, T, J, 3]
-        B, T, J, C = x.shape
-        x = x.view(B, T, J * C)   # [B, T, J*3]
-        x = x.mean(dim=1)         # temporal average → [B, J*3]
-        logits = self.fc(x)       # [B, num_actions]
-        return logits
-
-
-def normalize_action_name(a: str) -> str:
-    """
-    Human3.6M often has names like 'Photo 2', 'Directions 1', 'Walking 1'.
-    But define_actions() typically uses base names like 'Photo', 'Directions', 'Walking'.
-
-    This function maps:
-        'Photo 2'       -> 'Photo'
-        'SittingDown 1' -> 'SittingDown'
-        'Walking'       -> 'Walking'  (no change)
-    """
-    a = str(a)
-    base = a.split(' ')[0]
-    return base
-
-
 def load_backbone_checkpoint_from_path(path, model, device='cpu'):
     """
     Load a backbone checkpoint directly from a .pth file.
@@ -113,6 +72,47 @@ def load_backbone_checkpoint_from_path(path, model, device='cpu'):
     except AttributeError:
         # Older PyTorch versions may return a simple list/tuple
         print("Checkpoint loaded (strict=False).")
+
+
+class ActionHead(nn.Module):
+    """
+    Simple action recognition head on top of 3D poses.
+
+    Input:  output_3D of shape [B, T, J, 3]
+    Output: logits [B, num_actions]
+    """
+    def __init__(self, num_joints=17, num_actions=15, hidden_dim=256):
+        super().__init__()
+        self.num_joints = num_joints
+        self.fc = nn.Sequential(
+            nn.Linear(num_joints * 3, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(hidden_dim, num_actions)
+        )
+
+    def forward(self, x):
+        # x: [B, T, J, 3]
+        B, T, J, C = x.shape
+        x = x.view(B, T, J * C)   # [B, T, J*3]
+        x = x.mean(dim=1)         # temporal average → [B, J*3]
+        logits = self.fc(x)       # [B, num_actions]
+        return logits
+
+
+def normalize_action_name(a: str) -> str:
+    """
+    Human3.6M often has names like 'Photo 2', 'Directions 1', 'Walking 1'.
+    But define_actions() typically uses base names like 'Photo', 'Directions', 'Walking'.
+
+    This function maps:
+        'Photo 2'       -> 'Photo'
+        'SittingDown 1' -> 'SittingDown'
+        'Walking'       -> 'Walking'  (no change)
+    """
+    a = str(a)
+    base = a.split(' ')[0]
+    return base
 
 
 def train(dataloader, model, action_head, optimizer, epoch,
@@ -292,11 +292,11 @@ if __name__ == '__main__':
     # Load pretrained weights if provided.
     # Now supports either a DIRECTORY (original behavior) or a direct .pth FILE path.
     if args.previous_dir != '':
-        # If previous_dir looks like a .pth file, load that file directly.
         if args.previous_dir.endswith('.pth'):
+            # Treat previous_dir as a FILE path
             load_backbone_checkpoint_from_path(args.previous_dir, model, device='cpu')
         else:
-            # Original behavior: treat previous_dir as a directory and use Load_model
+            # Original behavior: treat previous_dir as a DIRECTORY
             Load_model(args, model)
 
     # Freeze backbone: use pretrained HoT as fixed feature extractor
